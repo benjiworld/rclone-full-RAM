@@ -10,6 +10,11 @@ MIN_TMPFS_MIB=512
 MIN_FREE_MIB=256
 LOGFILE="${HOME}/rclone-mount-ram.log"
 TMPFS_PARENT="/tmp"
+
+RC_HOST="127.0.0.1"
+RC_PORT="5572"
+DASH_REFRESH_SECONDS=1
+MAX_ACTIVE_TRANSFERS=5
 # =========================
 
 RCLONE_PID=""
@@ -31,7 +36,7 @@ FREE_HEADROOM_KB=0
 FREE_HEADROOM_MIB=0
 
 need_cmds() {
-    for cmd in rclone awk numfmt ps id mountpoint mount grep sed tr printf sudo mkdir chmod chown ss tail nemo mktemp; do
+    for cmd in rclone awk numfmt ps id mountpoint mount grep sed tr printf sudo mkdir chmod chown ss tail nemo mktemp curl jq tput du df find sleep seq; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             echo "Error: '$cmd' is not installed." >&2
             exit 1
@@ -188,11 +193,171 @@ pick_fuse_umount() {
     fi
 }
 
+check_rc_port() {
+    if ss -ltnH "( sport = :${RC_PORT} )" 2>/dev/null | grep -q .; then
+        echo "Error: RC port ${RC_PORT} is already in use." >&2
+        exit 1
+    fi
+}
+
+human_bytes() {
+    numfmt --to=iec --suffix=B "${1:-0}" 2>/dev/null || echo "${1:-0}B"
+}
+
+format_duration() {
+    local t="${1:-0}"
+    t="${t%.*}"
+    [ -z "${t}" ] && t=0
+    printf '%02d:%02d:%02d' $((t / 3600)) $(((t % 3600) / 60)) $((t % 60))
+}
+
+render_bar() {
+    local used="${1:-0}"
+    local total="${2:-1}"
+    local width="${3:-30}"
+    local pct fill empty
+
+    [ "${total}" -le 0 ] && total=1
+    [ "${used}" -lt 0 ] && used=0
+
+    pct=$(( used * 100 / total ))
+    [ "${pct}" -gt 100 ] && pct=100
+
+    fill=$(( pct * width / 100 ))
+    empty=$(( width - fill ))
+
+    printf '['
+    printf '%*s' "${fill}" '' | tr ' ' '#'
+    printf '%*s' "${empty}" '' | tr ' ' '.'
+    printf '] %3d%%' "${pct}"
+}
+
+wait_for_rc() {
+    local url="http://${RC_HOST}:${RC_PORT}/core/stats"
+
+    for _ in $(seq 1 50); do
+        if curl -fsS -X POST "${url}" >/dev/null 2>&1; then
+            return 0
+        fi
+
+        if ! ps -p "${RCLONE_PID}" >/dev/null 2>&1; then
+            break
+        fi
+
+        sleep 0.2
+    done
+
+    return 1
+}
+
+monitor_rclone_cli() {
+    local url="http://${RC_HOST}:${RC_PORT}/core/stats"
+    local key stats_json bytes speed checks transfers errors elapsed total_bytes eta
+    local cache_used tmpfs_used tmpfs_avail tmpfs_total
+    local -a active_lines=()
+
+    tput civis 2>/dev/null || true
+
+    while ps -p "${RCLONE_PID}" >/dev/null 2>&1; do
+        stats_json=$(curl -fsS -X POST "${url}" 2>/dev/null || true)
+        cache_used=$(du -sb "${CACHE_DIR}" 2>/dev/null | awk '{print $1+0}')
+        read -r tmpfs_used tmpfs_avail tmpfs_total < <(
+            df -B1 --output=used,avail,size "${TMPFS_ROOT}" 2>/dev/null | awk 'NR==2{print $1,$2,$3}'
+        )
+
+        tput home 2>/dev/null || true
+        tput ed 2>/dev/null || printf '\033[2J\033[H'
+
+        echo "rclone activity dashboard  |  press q to quit  |  Ctrl+C cleans everything"
+        echo
+        echo "Remote     : ${REMOTE}"
+        echo "Mountpoint : ${MOUNTPOINT}"
+        echo "Cache dir  : ${CACHE_DIR}"
+        echo "RC         : http://${RC_HOST}:${RC_PORT}"
+        echo
+
+        if [ -n "${stats_json}" ]; then
+            bytes=$(jq -r '.bytes // 0' <<<"${stats_json}")
+            speed=$(jq -r '.speed // 0' <<<"${stats_json}")
+            checks=$(jq -r '.checks // 0' <<<"${stats_json}")
+            transfers=$(jq -r '.transfers // 0' <<<"${stats_json}")
+            errors=$(jq -r '.errors // 0' <<<"${stats_json}")
+            elapsed=$(jq -r '.elapsedTime // 0' <<<"${stats_json}")
+            total_bytes=$(jq -r '.totalBytes // 0' <<<"${stats_json}")
+            eta=$(jq -r 'if (.eta // null) == null then "-" else (.eta|tostring) end' <<<"${stats_json}")
+
+            echo "Transferred: $(human_bytes "${bytes}")"
+            echo "Speed      : $(human_bytes "${speed%.*}")/s"
+            echo "Checks     : ${checks}"
+            echo "Transfers  : ${transfers}"
+            echo "Errors     : ${errors}"
+            echo "Elapsed    : $(format_duration "${elapsed}")"
+            echo "ETA        : ${eta}"
+
+            if [ "${total_bytes}" -gt 0 ]; then
+                printf "Progress   : "
+                render_bar "${bytes}" "${total_bytes}" 36
+                echo "  $(human_bytes "${bytes}") / $(human_bytes "${total_bytes}")"
+            fi
+
+            mapfile -t active_lines < <(
+                jq -r '
+                    .transferring[]? |
+                    "\(.name // "unknown")|\(.percentage // 0)|\(.speedAvg // .speed // 0)|\(.bytes // 0)|\(.size // 0)"
+                ' <<<"${stats_json}" 2>/dev/null | head -n "${MAX_ACTIVE_TRANSFERS}"
+            )
+        else
+            echo "RC stats   : unavailable"
+            active_lines=()
+        fi
+
+        echo
+        echo "tmpfs use  : $(human_bytes "${tmpfs_used:-0}") / $(human_bytes "${tmpfs_total:-0}")"
+        printf "tmpfs fill : "
+        render_bar "${tmpfs_used:-0}" "${tmpfs_total:-1}" 36
+        echo
+        echo "cache use  : $(human_bytes "${cache_used:-0}") / $(human_bytes "$(( CACHE_MAX_MIB * 1024 * 1024 ))")"
+        printf "cache fill : "
+        render_bar "${cache_used:-0}" "$(( CACHE_MAX_MIB * 1024 * 1024 ))" 36
+        echo
+
+        echo
+        echo "Active transfers:"
+        if [ "${#active_lines[@]}" -eq 0 ]; then
+            echo "  (idle)"
+        else
+            local line name pct spd cur size
+            for line in "${active_lines[@]}"; do
+                IFS='|' read -r name pct spd cur size <<<"${line}"
+                echo "  - ${name}"
+                printf '    %s%%  %s/s  %s / %s\n' \
+                    "${pct%.*}" \
+                    "$(human_bytes "${spd%.*}")" \
+                    "$(human_bytes "${cur}")" \
+                    "$(human_bytes "${size}")"
+            done
+        fi
+
+        echo
+        echo "Recent log:"
+        tail -n 5 "${LOGFILE}" 2>/dev/null | sed 's/^/  /'
+
+        IFS= read -rsn1 -t "${DASH_REFRESH_SECONDS}" key || true
+        if [ "${key:-}" = "q" ] || [ "${key:-}" = "Q" ]; then
+            break
+        fi
+    done
+
+    tput cnorm 2>/dev/null || true
+}
+
 start_rclone_mount() {
     if mountpoint -q "${MOUNTPOINT}"; then
         echo "Error: ${MOUNTPOINT} is already mounted." >&2
         exit 1
     fi
+
+    check_rc_port
 
     : > "${LOGFILE}"
 
@@ -209,6 +374,11 @@ start_rclone_mount() {
       --vfs-read-chunk-size 32M \
       --vfs-read-chunk-size-limit 256M \
       --transfers 4 \
+      --rc \
+      --rc-addr "${RC_HOST}:${RC_PORT}" \
+      --rc-no-auth \
+      --stats 1s \
+      --stats-log-level NOTICE \
       --log-file "${LOGFILE}" \
       --log-level INFO &
 
@@ -250,17 +420,22 @@ launch_nemo() {
     nemo "${MOUNTPOINT}" >/dev/null 2>&1 &
     NEMO_PID=$!
 
-    echo "--- Press CTRL+C to close Nemo, unmount rclone, stop rclone, and unmount tmpfs ---"
+    echo "--- Press q in the dashboard or CTRL+C to close everything ---"
     echo "--- Local mountpoint: ${MOUNTPOINT} ---"
     echo "--- Cache directory: ${CACHE_DIR} ---"
-    echo "--- Check tmpfs: findmnt --target ${TMPFS_ROOT} ---"
-    echo "--- Check cache usage: du -sh ${CACHE_DIR} && df -h ${TMPFS_ROOT} ---"
-    echo "--- Live log: tail -f ${LOGFILE} ---"
+    echo "--- RC endpoint: http://${RC_HOST}:${RC_PORT} ---"
 
-    wait "${RCLONE_PID}"
+    if wait_for_rc; then
+        monitor_rclone_cli
+    else
+        echo "Warning: RC dashboard unavailable, falling back to plain wait."
+        wait "${RCLONE_PID}"
+    fi
 }
 
 cleanup() {
+    tput cnorm 2>/dev/null || true
+
     if [ "${CLEANED_UP}" = "true" ]; then
         return
     fi
@@ -280,6 +455,7 @@ cleanup() {
 
     if [ -n "${MOUNTPOINT:-}" ] && mountpoint -q "${MOUNTPOINT}" 2>/dev/null; then
         echo "Unmounting rclone FUSE mount..."
+        local FUSE_UMOUNT
         FUSE_UMOUNT=$(pick_fuse_umount)
         "${FUSE_UMOUNT}" -u "${MOUNTPOINT}" >/dev/null 2>&1 || sudo umount -l "${MOUNTPOINT}" >/dev/null 2>&1 || true
         sleep 1
