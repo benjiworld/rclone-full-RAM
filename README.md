@@ -109,4 +109,4 @@ Usa questa versione se vuoi:
 
 ## Licenza
 
-Aggiungi la tua licenza preferita, ad esempio MIT.
+MIT.
